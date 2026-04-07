@@ -34,5 +34,6 @@ Matrix<T> Matrix<T>::get_sub_matrix(const std::vector<Index>& indices) const {
 }
 
 template class Matrix<UserCost>;
+template class Matrix<UserDistance>;
 
 } // namespace vroom
