@@ -7,7 +7,9 @@ All rights reserved (see LICENSE).
 
 */
 
+#include <mutex>
 #include <numeric>
+#include <thread>
 
 #include "algorithms/local_search/insertion_search.h"
 #include "algorithms/local_search/local_search.h"
@@ -76,9 +78,11 @@ LocalSearch<Route,
             TSPFix>::LocalSearch(const Input& input,
                                  std::vector<Route>& sol,
                                  unsigned max_nb_jobs_removal,
+                                 unsigned nb_threads,
                                  const Timeout& timeout)
   : _input(input),
     _nb_vehicles(_input.vehicles.size()),
+    _nb_threads(nb_threads),
     _max_nb_jobs_removal(max_nb_jobs_removal),
     _deadline(timeout.has_value() ? utils::now() + timeout.value()
                                   : Deadline()),
@@ -403,6 +407,31 @@ void LocalSearch<Route,
     if (_deadline.has_value() && _deadline.value() < utils::now()) {
       break;
     }
+
+    // Precompute empty_route_ranks for RouteSplit operator.
+    std::vector<Index> empty_route_ranks;
+    if (!_input.has_homogeneous_locations() ||
+        !_input.has_homogeneous_profiles() ||
+        !_input.has_homogeneous_costs()) {
+      empty_route_ranks.reserve(_input.vehicles.size());
+      for (Index v = 0; v < _input.vehicles.size(); ++v) {
+        if (_sol[v].empty()) {
+          empty_route_ranks.push_back(v);
+        }
+      }
+    }
+
+    // Lambda wrapping all operator evaluations. Takes a subset of
+    // s_t_pairs to allow parallel evaluation by partitioning vehicle
+    // pairs across threads. The parameter name shadows the outer
+    // s_t_pairs so operator code inside is unchanged.
+    auto evaluate_ops = [&](
+        const std::vector<std::pair<Index, Index>>& s_t_pairs
+#ifdef LOG_LS_OPERATORS
+        ,
+        std::array<unsigned, OperatorName::MAX>& tried_moves
+#endif
+    ) {
 
     if (_input.has_jobs()) {
       // Move(s) that don't make sense for shipment-only instances.
@@ -1748,16 +1777,8 @@ void LocalSearch<Route,
 
     if (!_input.has_homogeneous_locations() ||
         !_input.has_homogeneous_profiles() || !_input.has_homogeneous_costs()) {
-      // RouteSplit stuff
-      std::vector<Index> empty_route_ranks;
-      empty_route_ranks.reserve(_input.vehicles.size());
-
-      for (Index v = 0; v < _input.vehicles.size(); ++v) {
-        if (_sol[v].empty()) {
-          empty_route_ranks.push_back(v);
-        }
-      }
-
+      // RouteSplit stuff (empty_route_ranks is precomputed outside the
+      // lambda to avoid redundant computation across threads).
       if (empty_route_ranks.size() >= 2) {
         for (const auto& [source, target] : s_t_pairs) {
           if (target != source || best_priorities[source] > 0 ||
@@ -1787,6 +1808,71 @@ void LocalSearch<Route,
           }
         }
       }
+    }
+
+    }; // end of evaluate_ops lambda.
+
+    // Dispatch operator evaluation: single-threaded fast path or
+    // multi-threaded partitioned by target vehicle.
+    if (_nb_threads <= 1) {
+      evaluate_ops(s_t_pairs
+#ifdef LOG_LS_OPERATORS
+                   ,
+                   tried_moves
+#endif
+      );
+    } else {
+      // Partition s_t_pairs by target vehicle so each thread writes
+      // to disjoint cells in best_gains/best_ops/best_priorities.
+      std::vector<std::vector<std::pair<Index, Index>>>
+        thread_pairs(_nb_threads);
+      for (const auto& [s, t] : s_t_pairs) {
+        thread_pairs[t % _nb_threads].push_back({s, t});
+      }
+
+#ifdef LOG_LS_OPERATORS
+      std::vector<std::array<unsigned, OperatorName::MAX>> per_thread_tried(
+        _nb_threads);
+      for (auto& arr : per_thread_tried) {
+        arr.fill(0);
+      }
+#endif
+
+      std::exception_ptr ep = nullptr;
+      std::mutex ep_m;
+      {
+        std::vector<std::jthread> eval_threads;
+        eval_threads.reserve(_nb_threads);
+        for (unsigned i = 0; i < _nb_threads; ++i) {
+          if (!thread_pairs[i].empty()) {
+            eval_threads.emplace_back([&, i]() {
+              try {
+                evaluate_ops(thread_pairs[i]
+#ifdef LOG_LS_OPERATORS
+                             ,
+                             per_thread_tried[i]
+#endif
+                );
+              } catch (...) {
+                std::scoped_lock<std::mutex> lock(ep_m);
+                ep = std::current_exception();
+              }
+            });
+          }
+        }
+      } // jthread destructors join all threads.
+
+      if (ep != nullptr) {
+        std::rethrow_exception(ep);
+      }
+
+#ifdef LOG_LS_OPERATORS
+      for (const auto& arr : per_thread_tried) {
+        for (unsigned op = 0; op < OperatorName::MAX; ++op) {
+          tried_moves[op] += arr[op];
+        }
+      }
+#endif
     }
 
     // Find best overall move, first checking priority increase then
@@ -2024,8 +2110,39 @@ void LocalSearch<Route,
       }
 
       // Update insertion ranks ranges.
-      for (std::size_t v = 0; v < _sol.size(); ++v) {
-        _sol_state.set_insertion_ranks(_sol[v], v);
+      if (_nb_threads <= 1) {
+        for (std::size_t v = 0; v < _sol.size(); ++v) {
+          _sol_state.set_insertion_ranks(_sol[v], v);
+        }
+      } else {
+        std::vector<std::vector<std::size_t>> v_thread_ranks(
+          _nb_threads, std::vector<std::size_t>());
+        for (std::size_t v = 0; v < _sol.size(); ++v) {
+          v_thread_ranks[v % _nb_threads].push_back(v);
+        }
+        std::exception_ptr ep = nullptr;
+        std::mutex ep_m;
+        {
+          std::vector<std::jthread> threads;
+          threads.reserve(_nb_threads);
+          for (unsigned i = 0; i < _nb_threads; ++i) {
+            if (!v_thread_ranks[i].empty()) {
+              threads.emplace_back([&, i]() {
+                try {
+                  for (auto v : v_thread_ranks[i]) {
+                    _sol_state.set_insertion_ranks(_sol[v], v);
+                  }
+                } catch (...) {
+                  std::scoped_lock<std::mutex> lock(ep_m);
+                  ep = std::current_exception();
+                }
+              });
+            }
+          }
+        }
+        if (ep != nullptr) {
+          std::rethrow_exception(ep);
+        }
       }
 
       // Refill jobs.
@@ -2034,14 +2151,51 @@ void LocalSearch<Route,
 
       // Update everything except what has already been updated in
       // try_job_additions.
-      for (std::size_t v = 0; v < _sol.size(); ++v) {
-        _sol_state.update_costs(_sol[v].route, v);
-        _sol_state.update_skills(_sol[v].route, v);
-        _sol_state.update_priorities(_sol[v].route, v);
-        _sol_state.set_node_gains(_sol[v].route, v);
-        _sol_state.set_edge_gains(_sol[v].route, v);
-        _sol_state.set_pd_matching_ranks(_sol[v].route, v);
-        _sol_state.set_pd_gains(_sol[v].route, v);
+      if (_nb_threads <= 1) {
+        for (std::size_t v = 0; v < _sol.size(); ++v) {
+          _sol_state.update_costs(_sol[v].route, v);
+          _sol_state.update_skills(_sol[v].route, v);
+          _sol_state.update_priorities(_sol[v].route, v);
+          _sol_state.set_node_gains(_sol[v].route, v);
+          _sol_state.set_edge_gains(_sol[v].route, v);
+          _sol_state.set_pd_matching_ranks(_sol[v].route, v);
+          _sol_state.set_pd_gains(_sol[v].route, v);
+        }
+      } else {
+        std::vector<std::vector<std::size_t>> v_thread_ranks(
+          _nb_threads, std::vector<std::size_t>());
+        for (std::size_t v = 0; v < _sol.size(); ++v) {
+          v_thread_ranks[v % _nb_threads].push_back(v);
+        }
+        std::exception_ptr ep = nullptr;
+        std::mutex ep_m;
+        {
+          std::vector<std::jthread> threads;
+          threads.reserve(_nb_threads);
+          for (unsigned i = 0; i < _nb_threads; ++i) {
+            if (!v_thread_ranks[i].empty()) {
+              threads.emplace_back([&, i]() {
+                try {
+                  for (auto v : v_thread_ranks[i]) {
+                    _sol_state.update_costs(_sol[v].route, v);
+                    _sol_state.update_skills(_sol[v].route, v);
+                    _sol_state.update_priorities(_sol[v].route, v);
+                    _sol_state.set_node_gains(_sol[v].route, v);
+                    _sol_state.set_edge_gains(_sol[v].route, v);
+                    _sol_state.set_pd_matching_ranks(_sol[v].route, v);
+                    _sol_state.set_pd_gains(_sol[v].route, v);
+                  }
+                } catch (...) {
+                  std::scoped_lock<std::mutex> lock(ep_m);
+                  ep = std::current_exception();
+                }
+              });
+            }
+          }
+        }
+        if (ep != nullptr) {
+          std::rethrow_exception(ep);
+        }
       }
     }
 

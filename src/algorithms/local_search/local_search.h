@@ -39,6 +39,7 @@ class LocalSearch {
 private:
   const Input& _input;
   const std::size_t _nb_vehicles;
+  const unsigned _nb_threads;
 
   const unsigned _max_nb_jobs_removal;
   const Deadline _deadline;
@@ -79,6 +80,7 @@ public:
   LocalSearch(const Input& input,
               std::vector<Route>& tw_sol,
               unsigned max_nb_jobs_removal,
+              unsigned nb_threads,
               const Timeout& timeout);
 
   utils::SolutionIndicators<Route> indicators() const;

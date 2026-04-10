@@ -231,6 +231,7 @@ protected:
           LocalSearch ls(_input,
                          solutions[rank],
                          max_nb_jobs_removal,
+                         nb_threads,
                          search_time);
           ls.run();
 
